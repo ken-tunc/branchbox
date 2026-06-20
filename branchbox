@@ -1,0 +1,215 @@
+#!/usr/bin/env bash
+# branchbox — per-worktree local preview environments on apple/container.
+#
+#   branchbox up   [dir]    deploy a preview for the worktree at dir (default: cwd)
+#   branchbox down [dir]    stop + remove the preview for dir (or pass a slug)
+#   branchbox url  [dir]    print the preview URL for dir
+#   branchbox list          list all previews
+#   branchbox gc            remove previews whose worktree no longer exists
+#
+# The target product needs no Dockerfile and no mention of `container`: its
+# source is bind-mounted into a generic runtime image and its dev command is
+# auto-detected. Each preview is reachable at  http://<branch-slug>.<domain>
+#
+set -euo pipefail
+
+# Containers register under apple/container's *default* DNS domain (config.toml
+# [dns] domain), NOT under any per-run flag. So derive the domain from there to
+# keep printed URLs resolvable; allow an explicit override; fall back to internal.
+container_default_domain() {
+  # Must stay total: under `set -euo pipefail` a failing pipeline here (e.g. the
+  # container daemon isn't running) would propagate through the command
+  # substitution below and abort branchbox before it can print usage/help.
+  container system property list 2>/dev/null \
+    | awk '/^\[dns\]/{f=1;next} /^\[/{f=0} f && $1=="domain"{gsub(/"/,"",$3);print $3;exit}' \
+    || true
+}
+BRANCHBOX_DOMAIN="${BRANCHBOX_DOMAIN:-$(container_default_domain)}"
+BRANCHBOX_DOMAIN="${BRANCHBOX_DOMAIN:-internal}"
+BRANCHBOX_IMAGE="${BRANCHBOX_IMAGE:-branchbox-runtime}"
+BRANCHBOX_PORT_DEFAULT="${BRANCHBOX_PORT:-3000}"
+STATE_DIR="${BRANCHBOX_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/branchbox}"
+
+mkdir -p "$STATE_DIR"
+
+die() { echo "branchbox: $*" >&2; exit 1; }
+
+# Name of the per-preview node_modules volume (kept in one place so up/down/gc agree).
+vol_name() { echo "branchbox-$1-node_modules"; }
+
+slugify() {
+  # branch name -> DNS-safe label
+  echo "$1" \
+    | tr '[:upper:]' '[:lower:]' \
+    | sed -E 's/[^a-z0-9]+/-/g; s/-+/-/g; s/^-//; s/-$//'
+}
+
+worktree_abspath() { ( cd "$1" 2>/dev/null && pwd ) || die "no such directory: $1"; }
+
+branch_of() {
+  local b
+  b="$(git -C "$1" rev-parse --abbrev-ref HEAD 2>/dev/null)" || die "not a git worktree: $1"
+  [ "$b" = "HEAD" ] && b="detached-$(git -C "$1" rev-parse --short HEAD)"
+  echo "$b"
+}
+
+# Auto-detect how to start the product's dev server. Override with BRANCHBOX_CMD.
+detect_cmd() {
+  local dir="$1"
+  if [ -n "${BRANCHBOX_CMD:-}" ]; then echo "$BRANCHBOX_CMD"; return; fi
+  if [ -f "$dir/package.json" ]; then
+    local pm=npm
+    [ -f "$dir/pnpm-lock.yaml" ] && pm=pnpm
+    [ -f "$dir/yarn.lock" ] && pm=yarn
+    if jq -e '.scripts.dev'   "$dir/package.json" >/dev/null 2>&1; then echo "$pm run dev"; return; fi
+    if jq -e '.scripts.start' "$dir/package.json" >/dev/null 2>&1; then echo "$pm start"; return; fi
+  fi
+  [ -f "$dir/manage.py" ] && { echo 'python3 manage.py runserver 0.0.0.0:'"$BRANCHBOX_PORT_DEFAULT"; return; }
+  [ -f "$dir/bin/rails" ] && { echo 'bin/rails server -b 0.0.0.0 -p '"$BRANCHBOX_PORT_DEFAULT"; return; }
+  echo ""
+}
+
+# Final slug = branch slug, plus an optional "-<label>" so a monorepo can run
+# several previews on one branch (e.g. --name web, --name api).
+compute_slug() {
+  local dir="$1" label="$2" slug
+  slug="$(slugify "$(branch_of "$dir")")"
+  [ -n "$slug" ] || die "could not derive a slug from the branch at $dir"
+  if [ -n "$label" ]; then slug="${slug}-$(slugify "$label")"; fi
+  echo "$slug"
+}
+
+cmd_up() {
+  local dir="" label="" port=""
+  local -a parts=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --dir)    dir="$2"; shift 2;;
+      --dir=*)  dir="${1#*=}"; shift;;
+      --name)   label="$2"; shift 2;;
+      --name=*) label="${1#*=}"; shift;;
+      --port)   port="$2"; shift 2;;
+      --port=*) port="${1#*=}"; shift;;
+      --)       shift; parts=("$@"); break;;
+      -*)       die "unknown option: $1 (use -- before a command starting with -)";;
+      *)        parts=("$@"); break;;
+    esac
+  done
+
+  dir="$(worktree_abspath "${dir:-$(pwd)}")"
+  local slug vol cmd
+  slug="$(compute_slug "$dir" "$label")"
+  port="${port:-$BRANCHBOX_PORT_DEFAULT}"
+  vol="$(vol_name "$slug")"
+
+  # Command: explicit args win; otherwise fall back to auto-detection.
+  if [ ${#parts[@]} -gt 0 ]; then
+    cmd="${parts[*]}"
+  else
+    cmd="$(detect_cmd "$dir")"
+    [ -n "$cmd" ] || die "no command given and none could be auto-detected; pass one, e.g. branchbox up npm run dev"
+  fi
+
+  # Fresh container each deploy (idempotent).
+  container delete -f "$slug" >/dev/null 2>&1 || true
+  container volume create "$vol" >/dev/null 2>&1 || true
+
+  echo "branchbox: deploying '$slug' -> http://${slug}.${BRANCHBOX_DOMAIN}:${port}"
+  echo "branchbox: cmd = $cmd"
+  container run -d --name "$slug" --dns-domain "$BRANCHBOX_DOMAIN" \
+    -v "${dir}:/app" -v "${vol}:/app/node_modules" -w /app \
+    -e HOST=0.0.0.0 -e HOSTNAME=0.0.0.0 -e PORT="$port" \
+    -e CHOKIDAR_USEPOLLING=true -e CHOKIDAR_INTERVAL=300 -e WATCHPACK_POLLING=true \
+    "$BRANCHBOX_IMAGE" sh -lc "$cmd" >/dev/null
+
+  printf '%s\t%s\t%s\n' "$dir" "$port" "http://${slug}.${BRANCHBOX_DOMAIN}:${port}" > "$STATE_DIR/$slug"
+  echo "branchbox: up. URL -> http://${slug}.${BRANCHBOX_DOMAIN}:${port}"
+  echo "branchbox: logs -> container logs -f ${slug}"
+}
+
+# Resolve a target preview slug from [--dir DIR] [--name LABEL] [slug].
+resolve_target() {
+  local dir="" label="" pos=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --dir)    dir="$2"; shift 2;;
+      --dir=*)  dir="${1#*=}"; shift;;
+      --name)   label="$2"; shift 2;;
+      --name=*) label="${1#*=}"; shift;;
+      *)        pos="$1"; shift;;
+    esac
+  done
+  # A positional that names an existing preview wins (target by slug directly).
+  if [ -n "$pos" ] && [ -f "$STATE_DIR/$pos" ]; then echo "$pos"; return; fi
+  if [ -n "$pos" ] && [ -z "$dir" ]; then dir="$pos"; fi
+  dir="$(worktree_abspath "${dir:-$(pwd)}")"
+  compute_slug "$dir" "$label"
+}
+
+cmd_down() {
+  local slug; slug="$(resolve_target "$@")"
+  container delete -f "$slug" >/dev/null 2>&1 || true
+  [ "${BRANCHBOX_PURGE:-0}" = "1" ] && container volume delete "$(vol_name "$slug")" >/dev/null 2>&1 || true
+  rm -f "$STATE_DIR/$slug"
+  echo "branchbox: down '$slug'"
+}
+
+cmd_url() {
+  local slug; slug="$(resolve_target "$@")"
+  [ -f "$STATE_DIR/$slug" ] || die "no preview for '$slug'"
+  cut -f3 "$STATE_DIR/$slug"
+}
+
+cmd_list() {
+  local f slug
+  printf '%-24s %-9s %s\n' SLUG STATUS URL
+  for f in "$STATE_DIR"/*; do
+    [ -e "$f" ] || continue
+    slug="$(basename "$f")"
+    local status; status="$(container ls --all --format json 2>/dev/null \
+      | jq -r --arg n "$slug" '.[] | select(.configuration.id==$n) | .status.state' 2>/dev/null | head -1 || true)"
+    printf '%-24s %-9s %s\n' "$slug" "${status:-?}" "$(cut -f3 "$f")"
+  done
+}
+
+cmd_gc() {
+  local f slug dir
+  for f in "$STATE_DIR"/*; do
+    [ -e "$f" ] || continue
+    slug="$(basename "$f")"
+    dir="$(cut -f1 "$f")"
+    if ! git -C "$dir" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+      echo "branchbox: gc '$slug' (worktree gone: $dir)"
+      container delete -f "$slug" >/dev/null 2>&1 || true
+      container volume delete "$(vol_name "$slug")" >/dev/null 2>&1 || true
+      rm -f "$f"
+    fi
+  done
+}
+
+case "${1:-}" in
+  up)   shift; cmd_up   "$@";;
+  down) shift; cmd_down "$@";;
+  url)  shift; cmd_url  "$@";;
+  list) cmd_list;;
+  gc)   cmd_gc;;
+  *) cat >&2 <<EOF
+usage: branchbox <command> [options]
+  up   [--dir DIR] [--name LABEL] [--port PORT] [command...]
+                 deploy a preview for the worktree at DIR (default: cwd).
+                 command... is the dev command to run (default: auto-detect).
+                 --name adds a "-LABEL" suffix so one branch can host several
+                 previews (e.g. monorepo web/api). --port sets the dev port.
+  down [--dir DIR] [--name LABEL] [slug]   remove a preview (BRANCHBOX_PURGE=1 drops its volume)
+  url  [--dir DIR] [--name LABEL] [slug]   print a preview URL
+  list           list previews and status
+  gc             remove previews whose worktree was deleted
+
+examples:
+  branchbox up                                  # auto-detect dev command
+  branchbox up pnpm dev                         # explicit command
+  branchbox up --dir apps/web --name web pnpm --filter web dev
+env: BRANCHBOX_DOMAIN(=$BRANCHBOX_DOMAIN) BRANCHBOX_PORT(=$BRANCHBOX_PORT_DEFAULT) BRANCHBOX_CMD BRANCHBOX_IMAGE(=$BRANCHBOX_IMAGE)
+EOF
+     exit 2;;
+esac
