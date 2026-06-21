@@ -1,1 +1,5 @@
 .DS_Store
+node_modules/
+# branchbox installs deps inside the container; running a preview in-place can
+# leave a lockfile in the mounted source.
+/examples/hello-web/package-lock.json
