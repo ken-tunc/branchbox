@@ -30,12 +30,59 @@ BRANCHBOX_IMAGE="${BRANCHBOX_IMAGE:-branchbox-runtime}"
 BRANCHBOX_PORT_DEFAULT="${BRANCHBOX_PORT:-3000}"
 STATE_DIR="${BRANCHBOX_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/branchbox}"
 
+# Resolve this script's real location (it may be symlinked onto PATH) so we can
+# find the bundled runtime/ assets next to it.
+_resolve_home() {
+  local src="${BASH_SOURCE[0]}" dir
+  while [ -h "$src" ]; do
+    dir="$(cd -P "$(dirname "$src")" && pwd)"
+    src="$(readlink "$src")"
+    case "$src" in /*) ;; *) src="$dir/$src";; esac
+  done
+  cd -P "$(dirname "$src")" && pwd
+}
+BRANCHBOX_HOME="$(_resolve_home)"
+DEV_ENTRY="$BRANCHBOX_HOME/runtime/dev-entry.sh"
+DEFAULT_DOCKERFILE="$BRANCHBOX_HOME/runtime/Dockerfile"
+
 mkdir -p "$STATE_DIR"
 
 die() { echo "branchbox: $*" >&2; exit 1; }
 
 # Name of the per-preview node_modules volume (kept in one place so up/down/gc agree).
 vol_name() { echo "branchbox-$1-node_modules"; }
+
+image_exists() { container image inspect "$1" >/dev/null 2>&1; }
+
+# Decide which image to run in, building on demand. Echoes the image name on
+# stdout; all build output/logging goes to stderr so it can be captured cleanly.
+#   --dockerfile given -> build it (content-hashed tag, so an unchanged file is a
+#                         cache hit). Such an image needs no branchbox-specific
+#                         lines; dev-entry.sh is bind-mounted in at run time.
+#   otherwise          -> use BRANCHBOX_IMAGE, auto-building the bundled runtime
+#                         if the default image is missing.
+resolve_image() {
+  local dockerfile="$1" context="$2"
+  if [ -n "$dockerfile" ]; then
+    [ -f "$dockerfile" ] || die "no such Dockerfile: $dockerfile"
+    [ -n "$context" ] || context="$(dirname "$dockerfile")"
+    local tag; tag="branchbox-img-$(cksum < "$dockerfile" | awk '{print $1}')"
+    echo "branchbox: building image from $dockerfile" >&2
+    container build -t "$tag" -f "$dockerfile" "$context" >&2
+    echo "$tag"
+    return
+  fi
+  local img="$BRANCHBOX_IMAGE"
+  if ! image_exists "$img"; then
+    if [ "$img" = "branchbox-runtime" ] && [ -f "$DEFAULT_DOCKERFILE" ]; then
+      echo "branchbox: building $img from $DEFAULT_DOCKERFILE" >&2
+      container build -t "$img" -f "$DEFAULT_DOCKERFILE" "$(dirname "$DEFAULT_DOCKERFILE")" >&2
+    else
+      die "image '$img' not found; build it or pass --dockerfile"
+    fi
+  fi
+  echo "$img"
+}
 
 slugify() {
   # branch name -> DNS-safe label
@@ -80,24 +127,28 @@ compute_slug() {
 }
 
 cmd_up() {
-  local dir="" label="" port=""
+  local dir="" label="" port="" dockerfile="" context=""
   local -a parts=()
   while [ $# -gt 0 ]; do
     case "$1" in
-      --dir)    dir="$2"; shift 2;;
-      --dir=*)  dir="${1#*=}"; shift;;
-      --name)   label="$2"; shift 2;;
-      --name=*) label="${1#*=}"; shift;;
-      --port)   port="$2"; shift 2;;
-      --port=*) port="${1#*=}"; shift;;
-      --)       shift; parts=("$@"); break;;
-      -*)       die "unknown option: $1 (use -- before a command starting with -)";;
-      *)        parts=("$@"); break;;
+      --dir)         dir="$2"; shift 2;;
+      --dir=*)       dir="${1#*=}"; shift;;
+      --name)        label="$2"; shift 2;;
+      --name=*)      label="${1#*=}"; shift;;
+      --port)        port="$2"; shift 2;;
+      --port=*)      port="${1#*=}"; shift;;
+      --dockerfile)  dockerfile="$2"; shift 2;;
+      --dockerfile=*) dockerfile="${1#*=}"; shift;;
+      --context)     context="$2"; shift 2;;
+      --context=*)   context="${1#*=}"; shift;;
+      --)            shift; parts=("$@"); break;;
+      -*)            die "unknown option: $1 (use -- before a command starting with -)";;
+      *)             parts=("$@"); break;;
     esac
   done
 
   dir="$(worktree_abspath "${dir:-$(pwd)}")"
-  local slug vol cmd
+  local slug vol cmd image
   slug="$(compute_slug "$dir" "$label")"
   port="${port:-$BRANCHBOX_PORT_DEFAULT}"
   vol="$(vol_name "$slug")"
@@ -110,17 +161,24 @@ cmd_up() {
     [ -n "$cmd" ] || die "no command given and none could be auto-detected; pass one, e.g. branchbox up npm run dev"
   fi
 
+  [ -f "$DEV_ENTRY" ] || die "missing $DEV_ENTRY (keep the runtime/ directory next to the branchbox script)"
+  image="$(resolve_image "$dockerfile" "$context")"
+
   # Fresh container each deploy (idempotent).
   container delete -f "$slug" >/dev/null 2>&1 || true
   container volume create "$vol" >/dev/null 2>&1 || true
 
   echo "branchbox: deploying '$slug' -> http://${slug}.${BRANCHBOX_DOMAIN}:${port}"
+  echo "branchbox: image = $image"
   echo "branchbox: cmd = $cmd"
+  # dev-entry.sh is injected (bind-mounted) rather than baked into the image, so
+  # any runtime image works. It prepares the toolchain/deps, then execs the cmd.
   container run -d --name "$slug" --dns-domain "$BRANCHBOX_DOMAIN" \
-    -v "${dir}:/app" -v "${vol}:/app/node_modules" -w /app \
+    -v "${dir}:/app" -v "${vol}:/app/node_modules" \
+    -v "${DEV_ENTRY}:/branchbox/dev-entry.sh:ro" -w /app \
     -e HOST=0.0.0.0 -e HOSTNAME=0.0.0.0 -e PORT="$port" \
     -e CHOKIDAR_USEPOLLING=true -e CHOKIDAR_INTERVAL=300 -e WATCHPACK_POLLING=true \
-    "$BRANCHBOX_IMAGE" sh -lc "$cmd" >/dev/null
+    "$image" sh /branchbox/dev-entry.sh sh -lc "$cmd" >/dev/null
 
   printf '%s\t%s\t%s\n' "$dir" "$port" "http://${slug}.${BRANCHBOX_DOMAIN}:${port}" > "$STATE_DIR/$slug"
   echo "branchbox: up. URL -> http://${slug}.${BRANCHBOX_DOMAIN}:${port}"
@@ -195,11 +253,14 @@ case "${1:-}" in
   gc)   cmd_gc;;
   *) cat >&2 <<EOF
 usage: branchbox <command> [options]
-  up   [--dir DIR] [--name LABEL] [--port PORT] [command...]
+  up   [--dir DIR] [--name LABEL] [--port PORT] [--dockerfile FILE] [--context DIR] [command...]
                  deploy a preview for the worktree at DIR (default: cwd).
                  command... is the dev command to run (default: auto-detect).
                  --name adds a "-LABEL" suffix so one branch can host several
                  previews (e.g. monorepo web/api). --port sets the dev port.
+                 --dockerfile builds a custom runtime image from FILE (no
+                 branchbox-specific lines needed); --context sets its build
+                 context (default: the Dockerfile's directory).
   down [--dir DIR] [--name LABEL] [slug]   remove a preview (BRANCHBOX_PURGE=1 drops its volume)
   url  [--dir DIR] [--name LABEL] [slug]   print a preview URL
   list           list previews and status
@@ -209,6 +270,7 @@ examples:
   branchbox up                                  # auto-detect dev command
   branchbox up pnpm dev                         # explicit command
   branchbox up --dir apps/web --name web pnpm --filter web dev
+  branchbox up --dockerfile ./Dockerfile.preview pnpm dev
 env: BRANCHBOX_DOMAIN(=$BRANCHBOX_DOMAIN) BRANCHBOX_PORT(=$BRANCHBOX_PORT_DEFAULT) BRANCHBOX_CMD BRANCHBOX_IMAGE(=$BRANCHBOX_IMAGE)
 EOF
      exit 2;;

@@ -23,7 +23,7 @@ sudo container system dns create internal           # *.internal resolution (adm
 mkdir -p ~/.config/container
 printf '[dns]\ndomain = "internal"\n' >> ~/.config/container/config.toml
 container system stop && container system start
-container build -t branchbox-runtime runtime/       # generic runtime image
+# (The generic runtime image is built automatically on first use.)
 ```
 
 ## Commands
@@ -41,6 +41,11 @@ The directory is the `--dir` option; positional args are the dev command. For a
 monorepo, give each preview a `--name LABEL` so one branch can host several
 (`branchbox up --dir apps/web --name web pnpm --filter web dev` →
 `http://<branch>-web.internal:<port>`). `down`/`url` take the same `--dir`/`--name`.
+
+If the app needs extra system deps, pass `--dockerfile FILE` (and optionally
+`--context DIR`): branchbox builds that image and runs the preview in it. The
+Dockerfile needs no branchbox-specific lines — just the toolchain (e.g.
+`FROM node:22-slim` + `apt-get install …`).
 
 ## Verifying a change (close the loop)
 

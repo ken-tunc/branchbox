@@ -44,12 +44,12 @@ mkdir -p ~/.config/container
 printf '[dns]\ndomain = "internal"\n' >> ~/.config/container/config.toml
 container system stop && container system start
 
-# 3) Build the generic runtime image.
-container build -t branchbox-runtime runtime/
-
-# 4) Put branchbox on your PATH (optional).
+# 3) Put branchbox on your PATH (optional).
 ln -s "$PWD/branchbox" /usr/local/bin/branchbox
 ```
+
+> The generic runtime image is built automatically on first use. To build it
+> ahead of time: `container build -t branchbox-runtime runtime/`.
 
 > branchbox derives the domain in the URLs it prints from the config.toml default
 > domain when possible (override with `BRANCHBOX_DOMAIN`). It matches what you set
@@ -90,13 +90,37 @@ branchbox down --name api
 branchbox down <branch>-web        # or target by slug
 ```
 
-Options: `--dir DIR`, `--name LABEL`, `--port PORT`.
+Options: `--dir DIR`, `--name LABEL`, `--port PORT`, `--dockerfile FILE`, `--context DIR`.
+
+### Custom runtime (extra system deps)
+
+If the generic runtime is missing something your app needs (system libraries, a
+specific interpreter, build tools…), point `--dockerfile` at your own Dockerfile.
+branchbox builds it (tagged by content, so an unchanged file is a cache hit) and
+runs the preview in it. The orchestration (`dev-entry.sh`) is bind-mounted in at
+run time, so **your Dockerfile needs no branchbox-specific lines** — just the
+toolchain:
+
+```dockerfile
+# Dockerfile.preview
+FROM node:22-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      imagemagick libvips-dev
+```
+
+```sh
+branchbox up --dockerfile ./Dockerfile.preview pnpm dev
+```
+
+`--context` sets the build context (default: the Dockerfile's directory). Source
+mount, dependency install, and hot reload all work the same as with the default
+runtime. (`BRANCHBOX_IMAGE=<name>` can point at a prebuilt image instead.)
 
 ## Use as a Claude Code skill
 
 This repo ships a `/branchbox` skill at `.claude/skills/branchbox/`. To make it
 available in Claude Code globally, symlink it into your user skills directory
-(the `branchbox` CLI must also be on your PATH — see step 4 of Setup):
+(the `branchbox` CLI must also be on your PATH — see step 3 of Setup):
 
 ```sh
 mkdir -p ~/.claude/skills
@@ -140,8 +164,8 @@ Used only when you don't pass a command to `up`:
 
 ```
 branchbox                       # the CLI
-runtime/Dockerfile              # generic runtime image
-runtime/dev-entry.sh            # prepares toolchain/deps and starts dev inside the container
+runtime/Dockerfile              # generic runtime image (toolchain only)
+runtime/dev-entry.sh            # bind-mounted into the container at run time: prepares toolchain/deps, then starts dev
 .claude/skills/branchbox/       # /branchbox skill for Claude Code
 examples/hello-web/             # tiny Express app to try branchbox against
 ```
